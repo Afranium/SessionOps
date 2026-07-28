@@ -7,8 +7,14 @@
       "config": { "distDir": "dist" }
     }
   ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "https://YOUR_RENDER_APP.onrender.com/api/$1" },
-    { "src": "/(.*)", "dest": "/index.html" }
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://sessionops.onrender.com/api/:path*"
+    },
+    {
+      "source": "/((?!api|assets|favicon.ico).*)",
+      "destination": "/index.html"
+    }
   ]
 }
