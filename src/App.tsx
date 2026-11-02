@@ -50,7 +50,7 @@ const statusPalette: Record<AttendanceStatus, string> = {
 };
 
 const modalityColors = ['#38bdf8', '#818cf8'];
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '';
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3002';
 
 function App() {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
@@ -60,6 +60,11 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [workbookNames, setWorkbookNames] = useState<string[]>([]);
   const [selectedWorkbook, setSelectedWorkbook] = useState('');
+  const [facilitators, setFacilitators] = useState<any[]>([]);
+  const [programFilter, setProgramFilter] = useState<'All'|'Postgraduate'|'Undergraduate'|'Diploma'>('All');
+  const [trackingDate, setTrackingDate] = useState<string>('');
+  const [selectedFacilitatorIds, setSelectedFacilitatorIds] = useState<number[]>([]);
+  const [facilitatorTracking, setFacilitatorTracking] = useState<Record<number, { status: AttendanceStatus; participants: number; substitute: string }>>({});
   const [message, setMessage] = useState('Load the provided timetable workbook to start tracking classes.');
 
   const refreshWorkbookList = async () => {
@@ -78,10 +83,40 @@ function App() {
       const response = await fetch(`${apiBaseUrl}/api/load-workbook${name ? `?name=${encodeURIComponent(name)}` : ''}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Unable to load workbook');
-      setSessions(data.sessions ?? []);
-      setMetrics(data.metrics ?? emptyMetrics);
-      setSelectedWorkbook(data.workbookName || name || '');
-      setMessage(`Loaded ${data.sessions?.length ?? 0} classes from ${data.workbookName || 'the selected workbook'}.`);
+      // If the workbook contains facilitator data, prefer that path
+      if (Array.isArray(data.facilitators) && data.facilitators.length) {
+        setFacilitators(data.facilitators);
+        setSessions([]);
+        setMetrics(emptyMetrics);
+        setSelectedWorkbook(data.workbookName || name || '');
+        setMessage(`Loaded ${data.facilitators.length} facilitators from ${data.workbookName || 'the selected workbook'}. Use the "Export facilitators" flow.`);
+      } else {
+        // handle cases where the sheet isn't the expected session sheet and the parser produced placeholder COURSE-# rows
+        const sessions = data.sessions ?? [];
+        const looksLikePlaceholders = sessions.length > 0 && typeof sessions[0].courseCode === 'string' && sessions[0].courseCode.startsWith('COURSE-');
+        if (looksLikePlaceholders) {
+          // try the facilitators endpoint as a fallback
+          try {
+            const resp = await fetch(`${apiBaseUrl}/api/facilitators`);
+            const facData = await resp.json();
+            if (resp.ok && Array.isArray(facData.facilitators) && facData.facilitators.length) {
+              setFacilitators(facData.facilitators);
+              setSessions([]);
+              setMetrics(emptyMetrics);
+              setSelectedWorkbook(facData.workbookName || name || '');
+              setMessage(`Loaded ${facData.facilitators.length} facilitators from ${facData.workbookName || 'the selected workbook'} (fallback).`);
+              return;
+            }
+          } catch (err) {
+            // ignore fallback error and continue with sessions
+          }
+        }
+
+        setSessions(sessions);
+        setMetrics(data.metrics ?? emptyMetrics);
+        setSelectedWorkbook(data.workbookName || name || '');
+        setMessage(`Loaded ${sessions.length ?? 0} classes from ${data.workbookName || 'the selected workbook'}.`);
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to load the workbook.');
     } finally {
@@ -109,16 +144,151 @@ function App() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Upload failed');
-      setSessions(data.sessions ?? []);
-      setMetrics(data.metrics ?? emptyMetrics);
-      setSelectedWorkbook(file.name);
-      setMessage(`Imported ${data.sessions?.length ?? 0} classes successfully.`);
+      // If upload returned facilitators (facilitator-style workbook), prefer that
+      if (Array.isArray(data.facilitators) && data.facilitators.length) {
+        setFacilitators(data.facilitators);
+        setSessions([]);
+        setMetrics(emptyMetrics);
+        setSelectedWorkbook(file.name);
+        setMessage(`Imported ${data.facilitators.length} facilitators successfully.`);
+      } else {
+        setSessions(data.sessions ?? []);
+        setMetrics(data.metrics ?? emptyMetrics);
+        setSelectedWorkbook(file.name);
+        setMessage(`Imported ${data.sessions?.length ?? 0} classes successfully.`);
+      }
       await refreshWorkbookList();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to process workbook.');
     } finally {
       setUploading(false);
       event.target.value = '';
+    }
+  };
+
+  const loadFacilitators = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/facilitators`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Unable to load facilitators');
+      setFacilitators(data.facilitators ?? []);
+      setMessage(`Loaded ${data.facilitators?.length ?? 0} facilitators from ${data.workbookName || 'workbook'}.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Unable to load facilitators.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const filteredFacilitators = useMemo(() => {
+    if (!facilitators || !facilitators.length) return [];
+    if (programFilter === 'All') return facilitators;
+    return facilitators.filter((f) => String(f.sheet || '').toLowerCase().includes(programFilter.toLowerCase()));
+  }, [facilitators, programFilter]);
+
+  const visibleFacilitators = useMemo(() => {
+    return filteredFacilitators.map((f) => ({ ...f, _id: facilitators.indexOf(f) }));
+  }, [filteredFacilitators, facilitators]);
+
+  useEffect(() => {
+    // initialize tracking state for each facilitator (keyed by original index)
+    const map: Record<number, { status: AttendanceStatus; participants: number; substitute: string }> = {};
+    facilitators.forEach((_, i) => {
+      map[i] = { status: 'Pending', participants: 0, substitute: '' };
+    });
+    setFacilitatorTracking(map);
+  }, [facilitators]);
+
+  const toggleSelectAll = (checked: boolean) => {
+    if (checked) setSelectedFacilitatorIds(visibleFacilitators.map((f) => f._id));
+    else setSelectedFacilitatorIds([]);
+  };
+
+  const toggleSelectOne = (id: number) => {
+    setSelectedFacilitatorIds((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
+  };
+
+  const exportSelected = async () => {
+    if (!selectedFacilitatorIds.length) return setMessage('No rows selected for export');
+    if (!trackingDate) return setMessage('Please choose a tracking date before exporting');
+    const rows = visibleFacilitators.filter((f) => selectedFacilitatorIds.includes(f._id)).map((f) => {
+      const track = facilitatorTracking[f._id] || { status: 'Pending' as AttendanceStatus, participants: 0, substitute: '' };
+      return ({
+        location: f.location,
+        course: f.course,
+        name: f.name,
+        phone: f.phone,
+        email: f.email,
+        status: track.status,
+        participants: track.participants,
+        substitute: track.substitute
+      });
+    });
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/export-facilitators`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ facilitators: rows, date: trackingDate })
+      });
+      if (!response.ok) {
+        let errMsg = 'Export failed';
+        try {
+          const err = await response.json();
+          errMsg = err.error || JSON.stringify(err);
+        } catch {
+          try {
+            const txt = await response.text();
+            if (txt) errMsg = txt;
+          } catch (e) {
+            // ignore
+          }
+        }
+        throw new Error(errMsg);
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `facilitators-selected-${trackingDate}.xlsx`;
+      link.click();
+      window.URL.revokeObjectURL(url);
+      setMessage(`Exported ${rows.length} selected rows.`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Export failed');
+    }
+  };
+
+  const exportFacilitators = async () => {
+    if (!filteredFacilitators.length) return setMessage('No facilitators to export');
+    if (!trackingDate) return setMessage('Please choose a tracking date before exporting');
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/export-facilitators`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ facilitators: filteredFacilitators, date: trackingDate })
+      });
+      if (!response.ok) {
+        let errMsg = 'Export failed';
+        try {
+          const err = await response.json();
+          errMsg = err.error || JSON.stringify(err);
+        } catch {
+          try { const txt = await response.text(); if (txt) errMsg = txt; } catch {}
+        }
+        throw new Error(errMsg);
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `facilitators-${programFilter}-${trackingDate}.xlsx`;
+      link.click();
+      window.URL.revokeObjectURL(url);
+      setMessage(`Exported ${filteredFacilitators.length} facilitator rows.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Export failed');
     }
   };
 
@@ -149,6 +319,11 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessions })
       });
+      if (!response.ok) {
+        let errMsg = 'Export failed';
+        try { const err = await response.json(); errMsg = err.error || JSON.stringify(err); } catch { try { const t = await response.text(); if (t) errMsg = t; } catch {} }
+        throw new Error(errMsg);
+      }
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -207,6 +382,21 @@ function App() {
               <span>{uploading ? 'Importing…' : 'Upload timetable'}</span>
               <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleUpload} />
             </label>
+            <button onClick={() => void loadFacilitators()} className="rounded-full border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200" disabled={loading}>
+              Load facilitators
+            </button>
+            <div className="flex items-center gap-2">
+              <select value={programFilter} onChange={(e) => setProgramFilter(e.target.value as any)} className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-slate-100">
+                <option value="All">All</option>
+                <option value="Postgraduate">Postgraduate</option>
+                <option value="Undergraduate">Undergraduate</option>
+                <option value="Diploma">Diploma</option>
+              </select>
+              <input type="date" value={trackingDate} onChange={(e) => setTrackingDate(e.target.value)} className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-slate-100" />
+              <button onClick={() => void exportFacilitators()} className="rounded-full bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-900" disabled={loading}>
+                Export facilitators
+              </button>
+            </div>
             <button onClick={() => void loadWorkbook('')} className="rounded-full border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-sm text-sky-300" disabled={loading}>
               {loading ? <span className="flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" />Loading</span> : 'Reload workbook'}
             </button>
@@ -249,6 +439,69 @@ function App() {
               </div>
             ))}
           </div>
+          {facilitators.length > 0 && (
+            <div className="mt-6">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="text-sm text-slate-400">Filter by program above and select rows to export with tracking details.</div>
+                <div className="flex items-center gap-2">
+                  <label className="text-sm text-slate-400">Select all</label>
+                  <input type="checkbox" onChange={(e) => toggleSelectAll(e.target.checked)} checked={selectedFacilitatorIds.length === visibleFacilitators.length && visibleFacilitators.length > 0} />
+                  <button onClick={() => void exportSelected()} className="rounded-full bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-900" disabled={!selectedFacilitatorIds.length || !trackingDate}>Export selected</button>
+                </div>
+              </div>
+
+              <div className="overflow-auto rounded-lg border border-slate-700">
+                <table className="w-full table-auto text-sm">
+                  <thead className="bg-slate-900/60 text-slate-300">
+                    <tr>
+                      <th className="px-3 py-2 text-left">#</th>
+                      <th className="px-3 py-2 text-left">Select</th>
+                      <th className="px-3 py-2 text-left">Location</th>
+                      <th className="px-3 py-2 text-left">Course</th>
+                      <th className="px-3 py-2 text-left">Lecturer</th>
+                      <th className="px-3 py-2 text-left">Phone</th>
+                      <th className="px-3 py-2 text-left">Email</th>
+                      <th className="px-3 py-2 text-left">Present</th>
+                      <th className="px-3 py-2 text-left">Rescheduled</th>
+                      <th className="px-3 py-2 text-left">Participants</th>
+                      <th className="px-3 py-2 text-left">Scheduled</th>
+                      <th className="px-3 py-2 text-left">Substitute</th>
+                      <th className="px-3 py-2 text-left">Program</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-slate-200">
+                    {visibleFacilitators.map((f) => (
+                      <tr key={f._id} className="border-t border-slate-800">
+                        <td className="px-3 py-2">{f._id + 1}</td>
+                        <td className="px-3 py-2"><input type="checkbox" checked={selectedFacilitatorIds.includes(f._id)} onChange={() => toggleSelectOne(f._id)} /></td>
+                        <td className="px-3 py-2">{f.location}</td>
+                        <td className="px-3 py-2">{f.course}</td>
+                        <td className="px-3 py-2">{f.name}</td>
+                        <td className="px-3 py-2">{f.phone}</td>
+                          <td className="px-3 py-2">{f.email}</td>
+                          <td className="px-3 py-2">
+                            <div className="flex items-center gap-2">
+                              {(['Present','Absent','Rescheduled'] as AttendanceStatus[]).map((s) => (
+                                <button key={s} onClick={() => setFacilitatorTracking((cur) => ({ ...cur, [f._id]: { ...(cur[f._id] || { status: 'Pending', participants: 0, substitute: '' }), status: s } }))} className={`px-2 py-1 text-xs rounded ${facilitatorTracking[f._id]?.status === s ? 'bg-emerald-500 text-slate-900' : 'bg-slate-800 text-slate-200'}`}>
+                                  {s}
+                                </button>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <input type="number" min={0} value={facilitatorTracking[f._id]?.participants ?? 0} onChange={(e) => setFacilitatorTracking((cur) => ({ ...cur, [f._id]: { ...(cur[f._id] || { status: 'Pending', participants: 0, substitute: '' }), participants: Number(e.target.value) } }))} className="w-20 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100" />
+                          </td>
+                          <td className="px-3 py-2">
+                            <input type="text" value={facilitatorTracking[f._id]?.substitute || ''} onChange={(e) => setFacilitatorTracking((cur) => ({ ...cur, [f._id]: { ...(cur[f._id] || { status: 'Pending', participants: 0, substitute: '' }), substitute: e.target.value } }))} className="rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm text-slate-100" />
+                          </td>
+                          <td className="px-3 py-2">{f.programme}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </section>
 
         <section className="mb-6 grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">

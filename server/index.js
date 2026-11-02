@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, '..');
 const uploadDir = path.join(__dirname, 'uploads');
 const sharedDataDir = path.join(projectRoot, 'data');
-const seedWorkbookPath = path.join(projectRoot, 'IDL 1ST AND 2ND SEMESTER 2025_2026.xlsx');
+const seedWorkbookPath = path.join(sharedDataDir, 'Facilitation_Timetable.xlsx');
 
 fs.mkdirSync(uploadDir, { recursive: true });
 fs.mkdirSync(sharedDataDir, { recursive: true });
@@ -94,6 +94,46 @@ const parseWorkbook = (buffer) => {
   const workbook = xlsx.read(buffer, { type: 'buffer' });
   const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
   return xlsx.utils.sheet_to_json(firstSheet, { defval: '' });
+};
+
+const parseFacilitatorsFromWorkbook = (buffer) => {
+  const workbook = xlsx.read(buffer, { type: 'buffer' });
+  const sheetNames = workbook.SheetNames;
+  const sheets = [];
+
+  sheetNames.forEach((name) => {
+    const sheet = workbook.Sheets[name];
+    const rows = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+    // find header row (contains Program or Course)
+    const headerIndex = rows.findIndex((r) => r && r.some((c) => String(c).toLowerCase().includes('program') || String(c).toLowerCase().includes('course') || String(c).toLowerCase().includes('name')));
+    if (headerIndex >= 0) {
+      const headers = rows[headerIndex].map((h) => String(h).trim());
+      const dataRows = rows.slice(headerIndex + 1).map((r) => {
+        const obj = {};
+        headers.forEach((h, i) => { obj[h || `col${i}`] = r[i] ?? ''; });
+        return obj;
+      }).filter((r) => (r[headers[0]] || r[headers[2]]));
+      sheets.push({ sheetName: name, rows: dataRows });
+    }
+  });
+
+  // flatten all sheets into a single facilitator list
+  const facilitators = [];
+  sheets.forEach((s) => {
+    s.rows.forEach((r) => {
+      const programme = r['Program'] || r['PROGRAMME'] || r['Program '] || r['KWAME NKRUMAH UNIVERSITY OF SCIENCE AND TECHNOLOGY'] || '';
+      const location = r['Location'] || r['LOCATION'] || r['__EMPTY'] || '';
+      const course = r['Course'] || r['COURSE'] || r['__EMPTY_1'] || '';
+      const name = r['Name'] || r['NAME'] || r['__EMPTY_2'] || '';
+      const phone = r['Phone Number'] || r['PHONE NUMBER'] || r['__EMPTY_3'] || '';
+      const email = r['Email Address'] || r['EMAIL ADDRESS'] || r['__EMPTY_4'] || '';
+      if (course || name) {
+        facilitators.push({ programme: String(programme).trim(), location: String(location).trim(), course: String(course).trim(), name: String(name).trim(), phone: String(phone).trim(), email: String(email).trim(), sheet: s.sheetName });
+      }
+    });
+  });
+
+  return facilitators;
 };
 
 const buildMetrics = (sessions) => ({
@@ -192,7 +232,23 @@ app.get('/api/load-workbook', (req, res) => {
     const workbookPath = resolveWorkbookPath(workbookName);
     const workbookBuffer = fs.readFileSync(workbookPath);
     const rows = parseWorkbook(workbookBuffer);
-    res.json({ workbookName: path.basename(workbookPath), ...toSessionsPayload(rows) });
+    const facilitators = parseFacilitatorsFromWorkbook(workbookBuffer);
+    const payload = { workbookName: path.basename(workbookPath), ...toSessionsPayload(rows) };
+    if (Array.isArray(facilitators) && facilitators.length) {
+      payload.facilitators = facilitators;
+    }
+    res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/facilitators', (_req, res) => {
+  try {
+    const workbookPath = resolveWorkbookPath('');
+    const buffer = fs.readFileSync(workbookPath);
+    const facilitators = parseFacilitatorsFromWorkbook(buffer);
+    res.json({ workbookName: path.basename(workbookPath), facilitators });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -208,7 +264,9 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     fs.copyFileSync(req.file.path, targetPath);
     const workbookBuffer = fs.readFileSync(req.file.path);
     const rows = parseWorkbook(workbookBuffer);
+    const facilitators = parseFacilitatorsFromWorkbook(workbookBuffer);
     const payload = toSessionsPayload(rows);
+    if (Array.isArray(facilitators) && facilitators.length) payload.facilitators = facilitators;
     fs.unlinkSync(req.file.path);
     res.json(payload);
   } catch (error) {
@@ -274,6 +332,39 @@ app.post('/api/export', express.json(), (req, res) => {
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument/spreadsheetml.sheet');
   res.setHeader('Content-Disposition', 'attachment; filename="weekend-class-operations.xlsx"');
   res.end(buffer);
+});
+
+app.post('/api/export-facilitators', express.json(), (req, res) => {
+  try {
+    const facilitators = Array.isArray(req.body?.facilitators) ? req.body.facilitators : [];
+    const trackingDate = req.body?.date ? String(req.body.date) : '';
+    const workbook = xlsx.utils.book_new();
+
+    const rows = [
+      ['Location', 'Course', 'Lecturer', 'Phone Number', 'Email', 'Tracking Date']
+    ];
+
+    facilitators.forEach((f) => {
+      rows.push([
+        f.location || '',
+        f.course || '',
+        f.name || '',
+        f.phone || '',
+        f.email || '',
+        trackingDate || ''
+      ]);
+    });
+
+    const sheet = xlsx.utils.aoa_to_sheet(rows);
+    xlsx.utils.book_append_sheet(workbook, sheet, 'Facilitators');
+
+    const buffer = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="facilitators-tracking.xlsx"');
+    res.end(buffer);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const port = Number(process.env.PORT || 3002);
