@@ -1,409 +1,606 @@
-import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
-import { BarChart3, BookOpenCheck, CalendarDays, Download, FileSpreadsheet, Loader2, MonitorPlay, UserRoundCog, Users } from 'lucide-react';
-import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  AlertCircle,
+  CalendarCheck2,
+  CheckCircle2,
+  Download,
+  LayoutDashboard,
+  ListChecks,
+  Loader2,
+  LogOut,
+  Search,
+  Upload,
+  X
+} from 'lucide-react';
 
-type Modality = 'Online' | 'Face-to-Face';
-type AttendanceStatus = 'Present' | 'Absent' | 'Rescheduled' | 'Pending';
+import {
+  AuthError,
+  bulkTracking,
+  checkSession,
+  fetchSessions,
+  filterSessions,
+  logout as apiLogout,
+  patchTracking
+} from './api';
+import type { AttendanceStatus, Filters, ImportRecord, SessionRow, Tracking } from './types';
+import { formatWeekend, isoDateOf, uniqueSorted, weekendKey } from './lib';
+import { Login } from './components/Login';
+import { Overview } from './components/Overview';
+import { SessionsTable } from './components/SessionsTable';
+import { ImportWizard } from './components/ImportWizard';
+import { ExportDialog } from './components/ExportDialog';
 
-interface SessionRecord {
-  id: string;
-  courseKey: string;
-  courseName: string;
-  courseCode: string;
-  date: string;
-  centre: string;
-  modality: Modality;
-  startTime: string;
-  endTime: string;
-  actualStart: string;
-  actualEnd: string;
-  durationMins: number;
-  participants: number;
-  delegated: boolean;
-  substitute: string;
-  facilitator: string;
-  status: AttendanceStatus;
-  block: string;
-}
+type View = 'overview' | 'sessions';
+type Toast = { kind: 'success' | 'error' | 'info'; message: string };
 
-interface MetricsSummary {
-  totalClasses: number;
-  onlineClasses: number;
-  faceToFaceClasses: number;
-  totalHours: string;
-  substituteRate: string;
-}
-
-const emptyMetrics: MetricsSummary = {
-  totalClasses: 0,
-  onlineClasses: 0,
-  faceToFaceClasses: 0,
-  totalHours: '0.0',
-  substituteRate: '0.0'
+const EMPTY_FILTERS: Filters = {
+  weekend: '',
+  programme: '',
+  centre: '',
+  modality: '',
+  status: '',
+  q: ''
 };
 
-const statusPalette: Record<AttendanceStatus, string> = {
-  Present: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-  Absent: 'bg-rose-500/15 text-rose-300 border-rose-500/30',
-  Rescheduled: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-  Pending: 'bg-slate-500/15 text-slate-300 border-slate-500/30'
-};
+function pickDefaultWeekend(keys: string[]) {
+  if (!keys.length) return '';
+  const todayKey = weekendKey(isoDateOf(new Date()));
+  if (keys.includes(todayKey)) return todayKey;
+  return keys.find((key) => key > todayKey) ?? keys[keys.length - 1];
+}
 
-const modalityColors = ['#38bdf8', '#818cf8'];
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '';
-
-function App() {
-  const [sessions, setSessions] = useState<SessionRecord[]>([]);
-  const [metrics, setMetrics] = useState<MetricsSummary>(emptyMetrics);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+export default function App() {
+  const [auth, setAuth] = useState<'checking' | 'in' | 'out'>('checking');
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const [imports, setImports] = useState<ImportRecord[]>([]);
   const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [workbookNames, setWorkbookNames] = useState<string[]>([]);
-  const [selectedWorkbook, setSelectedWorkbook] = useState('');
-  const [message, setMessage] = useState('Load the provided timetable workbook to start tracking classes.');
+  const [view, setView] = useState<View>('overview');
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [savingCount, setSavingCount] = useState(0);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
 
-  const refreshWorkbookList = async () => {
-    try {
-      const response = await fetch(`${apiBaseUrl}/api/workbooks`);
-      const data = await response.json();
-      setWorkbookNames(data.workbooks ?? []);
-    } catch {
-      setWorkbookNames([]);
-    }
-  };
+  const weekendInitialized = useRef(false);
+  const saveQueue = useRef(new Map<number, { timer: ReturnType<typeof setTimeout>; patch: Partial<Tracking> }>());
 
-  const loadWorkbook = async (name = '') => {
-    setLoading(true);
-    try {
-      const response = await fetch(`${apiBaseUrl}/api/load-workbook${name ? `?name=${encodeURIComponent(name)}` : ''}`);
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Unable to load workbook');
-      setSessions(data.sessions ?? []);
-      setMetrics(data.metrics ?? emptyMetrics);
-      setSelectedWorkbook(data.workbookName || name || '');
-      setMessage(`Loaded ${data.sessions?.length ?? 0} classes from ${data.workbookName || 'the selected workbook'}.`);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to load the workbook.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void refreshWorkbookList();
-    void loadWorkbook('');
+  const pushToast = useCallback((kind: Toast['kind'], message: string) => {
+    setToast({ kind, message });
   }, []);
 
-  const handleUpload = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4200);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
-    const formData = new FormData();
-    formData.append('file', file);
-    setUploading(true);
+  const load = useCallback(
+    async (initial = false) => {
+      if (initial) setLoading(true);
+      try {
+        const data = await fetchSessions();
+        setSessions(data.sessions);
+        setImports(data.imports);
+        if (!weekendInitialized.current && data.sessions.length) {
+          const keys = uniqueSorted(data.sessions.map((session) => weekendKey(session.date)));
+          setFilters((current) => ({ ...current, weekend: pickDefaultWeekend(keys) }));
+          weekendInitialized.current = true;
+        }
+      } catch (error) {
+        if (error instanceof AuthError) {
+          setAuth('out');
+        } else {
+          pushToast('error', error instanceof Error ? error.message : 'Could not load the tracker');
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    [pushToast]
+  );
 
-    try {
-      const response = await fetch(`${apiBaseUrl}/api/upload`, {
-        method: 'POST',
-        body: formData
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await checkSession();
+        if (cancelled) return;
+        if (result.authenticated) {
+          setAuth('in');
+          await load(true);
+        } else {
+          setAuth('out');
+        }
+      } catch {
+        if (!cancelled) setAuth('out');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [load]);
+
+  const flush = useCallback(
+    (id: number) => {
+      const entry = saveQueue.current.get(id);
+      if (!entry) return;
+      clearTimeout(entry.timer);
+      saveQueue.current.delete(id);
+      setSavingCount((count) => count + 1);
+
+      patchTracking(id, entry.patch)
+        .then(({ tracking }) => {
+          setSessions((current) =>
+            current.map((session) => (session.id === id ? { ...session, tracking } : session))
+          );
+        })
+        .catch((error) => {
+          if (error instanceof AuthError) {
+            setAuth('out');
+            return;
+          }
+          pushToast('error', error instanceof Error ? error.message : 'Could not save that change');
+          void load();
+        })
+        .finally(() => setSavingCount((count) => Math.max(0, count - 1)));
+    },
+    [load, pushToast]
+  );
+
+  const patch = useCallback(
+    (id: number, changes: Partial<Tracking>) => {
+      setSessions((current) =>
+        current.map((session) =>
+          session.id === id ? { ...session, tracking: { ...session.tracking, ...changes } } : session
+        )
+      );
+
+      const existing = saveQueue.current.get(id);
+      if (existing) clearTimeout(existing.timer);
+      const merged = { ...(existing?.patch ?? {}), ...changes };
+      const timer = setTimeout(() => flush(id), 450);
+      saveQueue.current.set(id, { timer, patch: merged });
+    },
+    [flush]
+  );
+
+  const bulk = useCallback(
+    async (status: AttendanceStatus) => {
+      const ids = [...selected];
+      if (!ids.length) return;
+
+      ids.forEach((id) => {
+        const entry = saveQueue.current.get(id);
+        if (entry) {
+          clearTimeout(entry.timer);
+          saveQueue.current.delete(id);
+        }
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Upload failed');
-      setSessions(data.sessions ?? []);
-      setMetrics(data.metrics ?? emptyMetrics);
-      setSelectedWorkbook(file.name);
-      setMessage(`Imported ${data.sessions?.length ?? 0} classes successfully.`);
-      await refreshWorkbookList();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Unable to process workbook.');
+
+      setSessions((current) =>
+        current.map((session) =>
+          ids.includes(session.id)
+            ? { ...session, tracking: { ...session.tracking, status } }
+            : session
+        )
+      );
+      setSelected(new Set());
+
+      try {
+        const result = await bulkTracking(ids, { status });
+        const updated = new Map(result.updated.map((item) => [item.id, item.tracking]));
+        setSessions((current) =>
+          current.map((session) => (updated.has(session.id) ? { ...session, tracking: updated.get(session.id)! } : session))
+        );
+        pushToast('success', `${ids.length} classes marked ${status.toLowerCase()}.`);
+      } catch (error) {
+        if (error instanceof AuthError) {
+          setAuth('out');
+          return;
+        }
+        pushToast('error', error instanceof Error ? error.message : 'Bulk update failed');
+        void load();
+      }
+    },
+    [load, pushToast, selected]
+  );
+
+  const filtered = useMemo(() => filterSessions(sessions, filters), [sessions, filters]);
+
+  const weekendOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    sessions.forEach((session) => {
+      const key = weekendKey(session.date);
+      if (!key) return;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [sessions]);
+
+  const programmes = useMemo(() => uniqueSorted(sessions.map((session) => session.programme)), [sessions]);
+  const centres = useMemo(() => uniqueSorted(sessions.map((session) => session.centre)), [sessions]);
+
+  const pendingCount = useMemo(
+    () => sessions.filter((session) => session.tracking.status === 'Pending').length,
+    [sessions]
+  );
+
+  useEffect(() => {
+    setSelected(new Set());
+  }, [filters]);
+
+  const toggleSelect = (id: number) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const selectMany = (ids: number[], checked: boolean) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      ids.forEach((id) => (checked ? next.add(id) : next.delete(id)));
+      return next;
+    });
+  };
+
+  const handleLogout = async () => {
+    try {
+      await apiLogout();
     } finally {
-      setUploading(false);
-      event.target.value = '';
+      setSessions([]);
+      setImports([]);
+      setAuth('out');
     }
   };
 
-  const updateSelectedStatus = async (status: AttendanceStatus) => {
-    if (!selectedIds.length) return;
+  const handleImported = async () => {
+    weekendInitialized.current = false;
+    await load();
+    setFilters((current) => ({ ...current, weekend: '' }));
+    weekendInitialized.current = true;
+  };
 
-    const nextSessions = sessions.map((session) =>
-      selectedIds.includes(session.id) ? { ...session, status } : session
+  const clearFilters = () => {
+    setFilters((current) => ({ ...EMPTY_FILTERS, weekend: current.weekend }));
+  };
+
+  const activeFilterCount = [filters.programme, filters.centre, filters.modality, filters.status, filters.q].filter(Boolean).length;
+
+  if (auth === 'checking') {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#060910]">
+        <Loader2 className="h-5 w-5 animate-spin text-sky-400" />
+      </div>
     );
+  }
 
-    setSessions(nextSessions);
-    setSelectedIds([]);
-    setMessage(`Updated ${selectedIds.length} selected rows to ${status}.`);
-  };
-
-  const updateSessionValue = <K extends keyof SessionRecord>(sessionId: string, field: K, value: SessionRecord[K]) => {
-    setSessions((current) =>
-      current.map((session) => (session.id === sessionId ? { ...session, [field]: value } : session))
+  if (auth === 'out') {
+    return (
+      <Login
+        onSuccess={() => {
+          setAuth('in');
+          void load(true);
+        }}
+      />
     );
-  };
+  }
 
-  const exportWorkbook = async () => {
-    if (!sessions.length) return;
-
-    try {
-      const response = await fetch(`${apiBaseUrl}/api/export`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessions })
-      });
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'weekend-class-operations.xlsx';
-      link.click();
-      window.URL.revokeObjectURL(url);
-      setMessage('Exported a styled administrative workbook.');
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Export was not completed.');
-    }
-  };
-
-  const metricsCards = useMemo(
-    () => [
-      { label: 'Total classes', value: metrics.totalClasses, icon: BookOpenCheck, tone: 'from-sky-600 to-blue-500' },
-      { label: 'Online stream share', value: `${(((metrics.onlineClasses / Math.max(1, metrics.totalClasses)) * 100) || 0).toFixed(0)}%`, icon: MonitorPlay, tone: 'from-violet-600 to-fuchsia-500' },
-      { label: 'Face-to-face classes', value: metrics.faceToFaceClasses, icon: Users, tone: 'from-emerald-600 to-lime-500' },
-      { label: 'Taught hours', value: `${metrics.totalHours}h`, icon: CalendarDays, tone: 'from-amber-600 to-orange-500' }
-    ],
-    [metrics]
-  );
-
-  const chartData = useMemo(
-    () => [
-      { name: 'Online', value: metrics.onlineClasses },
-      { name: 'Face-to-face', value: metrics.faceToFaceClasses }
-    ],
-    [metrics]
-  );
-
-  const discrepancyCount = sessions.filter((session) => {
-    const scheduled = Number(session.startTime.split(':')[0] || 0) * 60 + Number(session.startTime.split(':')[1] || 0);
-    const actual = Number(session.actualStart.split(':')[0] || 0) * 60 + Number(session.actualStart.split(':')[1] || 0);
-    return Math.abs(actual - scheduled) > 15;
-  }).length;
+  const weekendLabel = filters.weekend ? formatWeekend(filters.weekend) : 'All weekends';
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <header className="border-b border-white/10 bg-slate-900/70 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-6 py-5 lg:px-8">
+    <div className="flex min-h-screen bg-[#060910] text-slate-200">
+      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-white/[0.06] bg-[#070b13] lg:flex">
+        <div className="flex items-center gap-3 px-5 py-5">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-400/15 text-sky-300 ring-1 ring-inset ring-sky-400/25">
+            <CalendarCheck2 className="h-5 w-5" />
+          </div>
           <div>
-            <div className="flex items-center gap-3">
-              <div className="rounded-2xl bg-sky-500/15 p-3 text-sky-400">
-                <BarChart3 className="h-6 w-6" />
+            <p className="text-sm font-semibold tracking-tight text-white">SessionOps</p>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">KNUST IDL</p>
+          </div>
+        </div>
+
+        <nav className="mt-2 space-y-1 px-3">
+          <NavItem
+            active={view === 'overview'}
+            icon={LayoutDashboard}
+            label="Overview"
+            onClick={() => setView('overview')}
+          />
+          <NavItem
+            active={view === 'sessions'}
+            icon={ListChecks}
+            label="Attendance tracker"
+            badge={pendingCount}
+            onClick={() => setView('sessions')}
+          />
+          <button
+            onClick={() => setImportOpen(true)}
+            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-slate-400 transition hover:bg-white/[0.04] hover:text-slate-200"
+          >
+            <Upload className="h-4 w-4" />
+            Import timetable
+          </button>
+        </nav>
+
+        <div className="mt-auto p-3">
+          <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/[0.05] text-[11px] font-semibold text-slate-300">
+                IT
               </div>
-              <div>
-                <h1 className="text-xl font-semibold">KNUST IDL Weekend Class Tracker</h1>
-                <p className="text-sm text-slate-400">Operational dashboard for weekend teaching, attendance, and Excel workflows.</p>
+              <div className="min-w-0">
+                <p className="truncate text-xs font-medium text-slate-200">IT Team</p>
+                <p className="truncate text-[10px] text-slate-500">Shared workspace</p>
               </div>
             </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200">
-              <FileSpreadsheet className="h-4 w-4" />
-              <span>{uploading ? 'Importing…' : 'Upload timetable'}</span>
-              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleUpload} />
-            </label>
-            <button onClick={() => void loadWorkbook('')} className="rounded-full border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-sm text-sky-300" disabled={loading}>
-              {loading ? <span className="flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" />Loading</span> : 'Reload workbook'}
-            </button>
-            <button onClick={() => void exportWorkbook()} className="rounded-full bg-sky-500 px-4 py-2 text-sm font-semibold text-slate-950">
-              <span className="flex items-center gap-2"><Download className="h-4 w-4" />Export workbook</span>
+            <button
+              onClick={handleLogout}
+              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border border-white/[0.07] px-2 py-1.5 text-[11px] text-slate-400 transition hover:border-white/15 hover:text-slate-200"
+            >
+              <LogOut className="h-3 w-3" /> Sign out
             </button>
           </div>
         </div>
-      </header>
+      </aside>
 
-      <main className="mx-auto max-w-7xl px-6 py-8 lg:px-8">
-        <section className="mb-6 rounded-3xl border border-white/10 bg-slate-900/70 p-4 shadow-2xl shadow-slate-950/30">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-semibold">Operations overview</h2>
-              <p className="text-sm text-slate-400">{message}</p>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-30 border-b border-white/[0.06] bg-[#060910]/85 backdrop-blur-xl">
+          <div className="flex flex-wrap items-center gap-2 px-4 py-3 lg:px-6">
+            <div className="mr-auto flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-sky-400/15 text-sky-300 ring-1 ring-inset ring-sky-400/25 lg:hidden">
+                <CalendarCheck2 className="h-4 w-4" />
+              </div>
+              <div>
+                <h1 className="text-[15px] font-semibold tracking-tight text-white">
+                  {view === 'overview' ? 'Overview' : 'Attendance tracker'}
+                </h1>
+                <p className="text-[11px] text-slate-500">
+                  {weekendLabel} · {filtered.length} classes
+                </p>
+              </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2 rounded-full border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-300">
-              <label className="text-slate-400">Shared workbook</label>
-              <select value={selectedWorkbook} onChange={(event) => {
-                const workbookName = event.target.value;
-                setSelectedWorkbook(workbookName);
-                void loadWorkbook(workbookName);
-              }} className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-slate-100">
-                <option value="">Default seed workbook</option>
-                {workbookNames.map((workbook) => (
-                  <option key={workbook} value={workbook}>{workbook}</option>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {view === 'sessions' && (
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+                  <input
+                    value={filters.q}
+                    onChange={(event) => setFilters((current) => ({ ...current, q: event.target.value }))}
+                    placeholder="Search course or facilitator"
+                    className="h-8 w-48 rounded-lg border border-white/[0.07] bg-white/[0.03] pl-8 pr-7 text-xs text-slate-200 outline-none placeholder:text-slate-600 focus:border-sky-400/40 sm:w-60"
+                  />
+                  {filters.q && (
+                    <button
+                      onClick={() => setFilters((current) => ({ ...current, q: '' }))}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                      aria-label="Clear search"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              )}
+
+              <select
+                value={filters.weekend}
+                onChange={(event) => setFilters((current) => ({ ...current, weekend: event.target.value }))}
+                className="h-8 max-w-[190px] rounded-lg border border-white/[0.07] bg-white/[0.03] px-2.5 text-xs text-slate-200 outline-none focus:border-sky-400/40"
+              >
+                <option value="">All weekends</option>
+                {weekendOptions.map(([key, count]) => (
+                  <option key={key} value={key}>
+                    {formatWeekend(key)} ({count})
+                  </option>
                 ))}
               </select>
-            </div>
-          </div>
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            {metricsCards.map((card) => (
-              <div key={card.label} className={`rounded-2xl bg-gradient-to-br ${card.tone} p-4 text-white`}>
-                <div className="mb-3 inline-flex rounded-2xl bg-white/15 p-2">
-                  <card.icon className="h-5 w-5" />
-                </div>
-                <p className="text-sm text-white/80">{card.label}</p>
-                <p className="text-3xl font-semibold">{card.value}</p>
-              </div>
-            ))}
-          </div>
-        </section>
 
-        <section className="mb-6 grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-          <div className="rounded-3xl border border-white/10 bg-slate-900/70 p-5 shadow-2xl shadow-slate-950/30">
-            <div className="mb-4 flex items-center justify-between">
-              <div>
-                <h3 className="text-lg font-semibold">Modality distribution</h3>
-                <p className="text-sm text-slate-400">Online vs face-to-face stream mix</p>
+              <div className="hidden items-center gap-1.5 px-1 text-[10px] text-slate-500 sm:flex">
+                {savingCount > 0 ? (
+                  <>
+                    <Loader2 className="h-3 w-3 animate-spin text-sky-400" /> Saving
+                  </>
+                ) : (
+                  <>
+                    <CheckCircle2 className="h-3 w-3 text-emerald-400" /> Saved
+                  </>
+                )}
               </div>
-              <div className="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-sm text-slate-300">
-                {metrics.substituteRate}% substitute coverage
-              </div>
-            </div>
-            <div className="h-72">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={chartData} dataKey="value" nameKey="name" innerRadius={70} outerRadius={110} paddingAngle={2}>
-                    {chartData.map((entry, index) => (
-                      <Cell key={entry.name} fill={modalityColors[index % modalityColors.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
+
+              <button
+                onClick={() => setImportOpen(true)}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 text-xs text-slate-300 transition hover:bg-white/[0.06]"
+              >
+                <Upload className="h-3.5 w-3.5" /> Import
+              </button>
+              <button
+                onClick={() => setExportOpen(true)}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-sky-400 px-3 text-xs font-semibold text-slate-950 transition hover:bg-sky-300"
+              >
+                <Download className="h-3.5 w-3.5" /> Export
+              </button>
             </div>
           </div>
 
-          <div className="rounded-3xl border border-white/10 bg-slate-900/70 p-5 shadow-2xl shadow-slate-950/30">
-            <h3 className="mb-4 text-lg font-semibold">Tracking controls</h3>
-            <div className="space-y-3">
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                <p className="text-sm text-slate-400">Selected rows</p>
-                <p className="text-2xl font-semibold">{selectedIds.length}</p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {(['Present', 'Absent', 'Rescheduled', 'Pending'] as AttendanceStatus[]).map((status) => (
-                  <button key={status} onClick={() => void updateSelectedStatus(status)} className={`rounded-full border px-3 py-2 text-sm ${statusPalette[status]}`}>
-                    Mark {status}
-                  </button>
-                ))}
-              </div>
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-300">
-                <div className="mb-2 flex items-center gap-2 text-sky-300"><UserRoundCog className="h-4 w-4" />Delegation monitoring</div>
-                <p>Rows showing a substitute facilitator are flagged in the grid and contribute to the substitute coverage metric.</p>
-              </div>
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-300">
-                <div className="mb-2 flex items-center gap-2 text-amber-300"><BarChart3 className="h-4 w-4" />Deviation tracking</div>
-                <p>{discrepancyCount} sessions show a timing variance beyond the 15-minute tolerance window.</p>
-              </div>
-            </div>
+          <div className="flex gap-1 border-t border-white/[0.05] px-4 py-2 lg:hidden">
+            <MobileTab active={view === 'overview'} onClick={() => setView('overview')}>Overview</MobileTab>
+            <MobileTab active={view === 'sessions'} onClick={() => setView('sessions')}>
+              Tracker {pendingCount > 0 && <span className="ml-1 rounded bg-white/10 px-1 text-[9px]">{pendingCount}</span>}
+            </MobileTab>
           </div>
-        </section>
+        </header>
 
-        <section className="overflow-hidden rounded-3xl border border-white/10 bg-slate-900/70 shadow-2xl shadow-slate-950/30">
-          <div className="border-b border-white/10 p-4">
-            <h3 className="text-lg font-semibold">Session operations grid</h3>
-            <p className="text-sm text-slate-400">Select rows to update attendance states in bulk or edit each row directly for the daily report.</p>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-white/10 text-sm">
-              <thead className="bg-slate-950/60 text-left text-slate-400">
-                <tr>
-                  <th className="px-3 py-3">
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.length > 0 && selectedIds.length === sessions.length}
-                      onChange={() => setSelectedIds(selectedIds.length === sessions.length ? [] : sessions.map((item) => item.id))}
-                      className="h-4 w-4 rounded border-slate-700 bg-slate-900"
-                    />
-                  </th>
-                  <th className="px-3 py-3">Course</th>
-                  <th className="px-3 py-3">Date</th>
-                  <th className="px-3 py-3">Centre</th>
-                  <th className="px-3 py-3">Modality</th>
-                  <th className="px-3 py-3">Scheduled</th>
-                  <th className="px-3 py-3">Actual</th>
-                  <th className="px-3 py-3">Participants</th>
-                  <th className="px-3 py-3">Facilitator</th>
-                  <th className="px-3 py-3">Status</th>
-                  <th className="px-3 py-3">Action</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/10">
-                {sessions.map((session) => {
-                  const isSelected = selectedIds.includes(session.id);
-                  return (
-                    <tr key={session.id} className={isSelected ? 'bg-sky-500/10' : 'bg-transparent'}>
-                      <td className="px-3 py-3">
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => setSelectedIds((current) => (current.includes(session.id) ? current.filter((id) => id !== session.id) : [...current, session.id]))}
-                          className="h-4 w-4 rounded border-slate-700 bg-slate-900"
-                        />
-                      </td>
-                      <td className="px-3 py-3">
-                        <div className="font-medium text-slate-100">{session.courseName || session.courseCode}</div>
-                        <div className="text-xs text-slate-500">{session.courseCode}</div>
-                      </td>
-                      <td className="px-3 py-3">{session.date}</td>
-                      <td className="px-3 py-3">{session.centre}</td>
-                      <td className="px-3 py-3">
-                        <span className={`rounded-full px-2 py-1 text-xs ${session.modality === 'Online' ? 'bg-sky-500/15 text-sky-300' : 'bg-violet-500/15 text-violet-300'}`}>
-                          {session.modality}
-                        </span>
-                      </td>
-                      <td className="px-3 py-3">
-                        <div className="flex flex-col gap-2">
-                          <input type="time" value={session.startTime} onChange={(event) => updateSessionValue(session.id, 'startTime', event.target.value)} className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
-                          <input type="time" value={session.endTime} onChange={(event) => updateSessionValue(session.id, 'endTime', event.target.value)} className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
-                        </div>
-                      </td>
-                      <td className="px-3 py-3">
-                        <div className="flex flex-col gap-2">
-                          <input type="time" value={session.actualStart} onChange={(event) => updateSessionValue(session.id, 'actualStart', event.target.value)} className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
-                          <input type="time" value={session.actualEnd} onChange={(event) => updateSessionValue(session.id, 'actualEnd', event.target.value)} className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
-                        </div>
-                      </td>
-                      <td className="px-3 py-3">
-                        <input type="number" min="0" value={session.participants} onChange={(event) => updateSessionValue(session.id, 'participants', Number(event.target.value))} className="w-20 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
-                      </td>
-                      <td className="px-3 py-3">
-                        <div className="flex flex-col gap-2">
-                          <input type="text" value={session.substitute} onChange={(event) => updateSessionValue(session.id, 'substitute', event.target.value)} placeholder="Substitute" className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
-                          <label className="flex items-center gap-2 text-xs text-slate-400">
-                            <input type="checkbox" checked={session.delegated} onChange={(event) => updateSessionValue(session.id, 'delegated', event.target.checked)} className="h-3 w-3 rounded border-slate-700 bg-slate-900" />
-                            Delegated
-                          </label>
-                        </div>
-                      </td>
-                      <td className="px-3 py-3">
-                        <div className="flex flex-col gap-2">
-                          <select value={session.status} onChange={(event) => updateSessionValue(session.id, 'status', event.target.value as AttendanceStatus)} className="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs">
-                            {(['Present', 'Absent', 'Rescheduled', 'Pending'] as AttendanceStatus[]).map((option) => (
-                              <option key={option} value={option}>{option}</option>
-                            ))}
-                          </select>
-                          <span className={`rounded-full border px-2 py-1 text-center text-xs ${statusPalette[session.status]}`}>{session.status}</span>
-                        </div>
-                      </td>
-                      <td className="px-3 py-3">
-                        <button onClick={() => updateSessionValue(session.id, 'status', 'Present')} className="rounded-full bg-emerald-500/15 px-3 py-2 text-xs font-semibold text-emerald-300">
-                          Present
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </main>
+        <main className="mx-auto w-full max-w-[1500px] flex-1 px-4 py-5 lg:px-6">
+          {view === 'sessions' && (
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              <FilterSelect
+                label="Programme"
+                value={filters.programme}
+                options={programmes}
+                onChange={(value) => setFilters((current) => ({ ...current, programme: value }))}
+              />
+              <FilterSelect
+                label="Centre"
+                value={filters.centre}
+                options={centres}
+                onChange={(value) => setFilters((current) => ({ ...current, centre: value }))}
+              />
+              <FilterSelect
+                label="Modality"
+                value={filters.modality}
+                options={['Online', 'Face-to-Face']}
+                onChange={(value) => setFilters((current) => ({ ...current, modality: value }))}
+              />
+              <FilterSelect
+                label="Status"
+                value={filters.status}
+                options={['Present', 'Absent', 'Rescheduled', 'Pending']}
+                onChange={(value) => setFilters((current) => ({ ...current, status: value }))}
+              />
+              {activeFilterCount > 0 && (
+                <button
+                  onClick={clearFilters}
+                  className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-[11px] text-slate-400 transition hover:text-white"
+                >
+                  <X className="h-3 w-3" /> Clear {activeFilterCount}
+                </button>
+              )}
+            </div>
+          )}
+
+          {loading ? (
+            <div className="flex h-64 items-center justify-center">
+              <Loader2 className="h-5 w-5 animate-spin text-sky-400" />
+            </div>
+          ) : view === 'overview' ? (
+            <Overview
+              sessions={filtered}
+              imports={imports}
+              weekend={filters.weekend}
+              onGoToSessions={() => setView('sessions')}
+              onPatch={patch}
+              onImport={() => setImportOpen(true)}
+            />
+          ) : (
+            <SessionsTable
+              sessions={filtered}
+              selected={selected}
+              onToggle={toggleSelect}
+              onSelectMany={selectMany}
+              onPatch={patch}
+              onBulk={bulk}
+              onClearSelection={() => setSelected(new Set())}
+              onClearFilters={clearFilters}
+            />
+          )}
+        </main>
+      </div>
+
+      <ImportWizard
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onImported={handleImported}
+        onOpenTracker={() => setView('sessions')}
+      />
+      <ExportDialog
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+        sessions={filtered}
+        allCount={sessions.length}
+        onDone={(message) => pushToast('success', message)}
+      />
+
+      {toast && (
+        <div className="fixed bottom-5 right-5 z-[70] flex max-w-sm items-start gap-2.5 rounded-xl border border-white/10 bg-[#0d1421]/95 px-4 py-3 shadow-[0_20px_60px_-20px_rgba(0,0,0,0.9)] backdrop-blur-xl">
+          {toast.kind === 'success' && <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />}
+          {toast.kind === 'error' && <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />}
+          {toast.kind === 'info' && <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-sky-400" />}
+          <p className="text-xs leading-relaxed text-slate-200">{toast.message}</p>
+          <button onClick={() => setToast(null)} className="ml-1 text-slate-500 hover:text-white" aria-label="Dismiss">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-export default App;
+function NavItem({
+  active,
+  icon: Icon,
+  label,
+  badge,
+  onClick
+}: {
+  active: boolean;
+  icon: typeof LayoutDashboard;
+  label: string;
+  badge?: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition ${
+        active
+          ? 'bg-white/[0.06] text-white ring-1 ring-inset ring-white/[0.06]'
+          : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
+      }`}
+    >
+      <Icon className="h-4 w-4" />
+      <span className="flex-1 text-left">{label}</span>
+      {badge ? (
+        <span className="rounded-md bg-amber-400/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">{badge}</span>
+      ) : null}
+    </button>
+  );
+}
+
+function MobileTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-lg px-3 py-1.5 text-xs transition ${
+        active ? 'bg-white/[0.07] text-white' : 'text-slate-500 hover:text-slate-300'
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function FilterSelect({
+  label,
+  value,
+  options,
+  onChange
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <select
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      className={`h-8 rounded-lg border px-2.5 text-[11px] outline-none transition ${
+        value
+          ? 'border-sky-400/30 bg-sky-400/[0.07] text-sky-200'
+          : 'border-white/[0.07] bg-white/[0.03] text-slate-400'
+      }`}
+    >
+      <option value="">{label}: all</option>
+      {options.map((option) => (
+        <option key={option} value={option}>
+          {option}
+        </option>
+      ))}
+    </select>
+  );
+}
