@@ -1,3 +1,5 @@
+import './env.js';
+
 import express from 'express';
 import multer from 'multer';
 import fs from 'node:fs';
@@ -96,7 +98,7 @@ app.post('/api/login', (req, res) => {
     return res.status(401).json({ error: 'Incorrect password' });
   }
   clearRateLimit(ip);
-  issueCookie(res);
+  issueCookie(req, res);
   return res.json({ authenticated: true });
 });
 

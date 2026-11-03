@@ -105,6 +105,33 @@ provided, adjust the columns and layout in `server/export.js` to match it.
 
 ## Deployment
 
+### Run it on an office machine (no hosting cost)
+
+One machine keeps the database and serves the app to the team over the office network.
+Every staff member sees the same data because they all use that machine.
+
+1. Use an always-on PC or small server with Node 22.5 or newer.
+2. Clone the repository, run `npm ci`, create `.env` with `APP_PASSWORD` and
+   `APP_SESSION_SECRET`, then run `npm run build`.
+3. Start it with `npm start`. It listens on port 3002.
+4. Find the machine's LAN address with `ip addr` (for example `192.168.1.20`) and allow
+   port 3002 through the firewall.
+5. The team opens `http://192.168.1.20:3002` on any device on the same network.
+
+To keep it running after logout or reboot, install the sample systemd unit:
+
+```bash
+sudo cp deploy/sessionops.service.example /etc/systemd/system/sessionops.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now sessionops
+```
+
+Edit the paths and user in the unit first. Back up `data/sessionops.db` on a schedule
+(a daily `cp` to another disk is enough). The machine must stay on during working hours;
+if it is off, the team cannot mark attendance.
+
+### Render
+
 `render.yaml` describes a single Render web service on the starter plan with a 1 GB disk
 mounted at `/var/data`. The disk is what makes attendance survive a redeploy, and Render's
 free tier does not offer one.

@@ -1,0 +1,18 @@
+[Unit]
+Description=SessionOps weekend class attendance tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace with the account that owns the checkout.
+User=YOUR_USER
+WorkingDirectory=/opt/sessionops
+# Replace with the output of: which node
+ExecStart=/usr/bin/node server/index.js
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

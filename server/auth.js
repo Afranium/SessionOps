@@ -4,7 +4,6 @@ const PASSWORD = process.env.APP_PASSWORD || 'sessionops';
 const SECRET = process.env.APP_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const COOKIE_NAME = 'so_session';
 const TTL_MS = 1000 * 60 * 60 * 12;
-const IS_PROD = process.env.NODE_ENV === 'production';
 
 if (!process.env.APP_PASSWORD) {
   console.warn('[auth] APP_PASSWORD is not set. Using the development password "sessionops".');
@@ -50,13 +49,16 @@ export function clearRateLimit(ip) {
   attempts.delete(ip);
 }
 
-export function issueCookie(res) {
+export function issueCookie(req, res) {
   const payload = Buffer.from(JSON.stringify({ exp: Date.now() + TTL_MS })).toString('base64url');
   const token = `${payload}.${sign(payload)}`;
+  // Render terminates TLS and forwards the protocol. A LAN install is plain HTTP,
+  // so only mark the cookie Secure when this request actually arrived over HTTPS.
+  const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
   res.cookie(COOKIE_NAME, token, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: IS_PROD,
+    secure,
     maxAge: TTL_MS,
     path: '/'
   });
