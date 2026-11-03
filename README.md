@@ -12,8 +12,9 @@ that meets on four weekends produces four rows, each marked separately.
 - **Server**: Express, SQLite through Node's built-in `node:sqlite` (no native build step)
 - **Frontend**: React + Vite + Tailwind, served by the same Express process
 - **Auth**: one shared team password, signed http-only cookie, login rate limiting
-- **Import**: `xlsx`, with a column-mapping step so any timetable layout can be loaded
-- **Export**: `xlsx` workbook with Tracking, Summary and By programme sheets
+- **Import**: `xlsx`; the school's weekend workbook is detected automatically, with a
+  column-mapping fallback for any other layout
+- **Export**: `xlsx` weekend report plus Tracking, Summary and By programme sheets
 
 ## Local setup
 
@@ -50,11 +51,23 @@ Never run production without both secrets set.
 
 ## Importing a timetable
 
-1. Click **Import** and choose an `.xlsx`, `.xls` or `.csv` file.
-2. Pick the sheet and header row if the file has title rows above the table.
-3. Map the columns. Only **Date** and either **Course code** or **Course title** are
-   required; everything else is optional.
-4. Import.
+The school workbook (`IDL 1ST AND 2ND SEMESTER 2025_2026.xlsx`) is recognised on its own.
+It has one sheet per weekend, with a dated Saturday section and Sunday section. The importer
+reads every section, maps the headers per semester, and pre-fills the attendance it finds:
+
+- `NO. OF STUDENTS` / `N0. OF PARTIIICPANTS` becomes the participant count
+- a different `FACILITATOR PRESENT` becomes a delegation and substitute
+- `Postponed` becomes the Rescheduled status
+- `S_TIME`, `E_TIME`, venue and programme are carried over
+- columns the tracker does not model are kept with the class and written back on export
+
+After upload the wizard lists every weekend with its dates, class count, recorded statuses,
+and any warning. Untick a weekend that looks wrong, then import the rest. Warnings cover
+non-weekend dates, single-row sections, repeated dates, and labels whose year was corrected
+to the workbook's academic year.
+
+For any other layout, choose the file, pick the sheet and header row, map the columns, and
+import. Only **Date** and either **Course code** or **Course title** are required.
 
 Mapping notes:
 
@@ -92,16 +105,21 @@ Variance is the difference between the scheduled start and the actual start. Any
 
 ## Export
 
-**Export** writes an `.xlsx` workbook for either the current filtered view or everything:
+**Export** writes an `.xlsx` workbook for either the current filtered view or everything.
+Choose one of two layouts:
 
-- **Tracking**: one row per class with every schedule and tracking field, including
-  variance in minutes
+- **Weekend report**: one sheet per weekend, matching the school workbook. Each sheet has a
+  dated Saturday and Sunday section, the school columns (programme, course, facilitator,
+  venue, times, participants) and the recorded fields (status, actual times, modality held,
+  delegation, substitute, reschedule date/time, variance, notes). Programme cells are merged
+  like the original. A Summary and By programme sheet are appended.
+- **Flat tracking**: one row per class with every schedule and tracking field.
+
+Both layouts include:
+
 - **Summary**: totals, attendance rate, hours, substitute coverage, deviations over 15
   minutes
 - **By programme**: class counts per programme
-
-The school's current report format is not in this repository yet. Once a sample is
-provided, adjust the columns and layout in `server/export.js` to match it.
 
 ## Deployment
 
@@ -146,7 +164,7 @@ running).
 ## Tests
 
 ```bash
-npm test        # date/time normalisation, header detection, import records, export
+npm test        # normalisation, weekly workbook parsing, import records, export
 npm run typecheck
 ```
 
@@ -158,7 +176,8 @@ server/
   db.js       schema, migrations, session queries, tracking upserts
   auth.js     password check, cookie signing, rate limiting
   excel.js    workbook reading, normalisation, header detection, column mapping
-  export.js   report workbook
+  weekly.js   school weekend-workbook detection, section parsing, tracking prefill
+  export.js   weekend report and flat tracking workbooks
 src/
   App.tsx     shell, filters, autosave queue, bulk actions
   api.ts      typed API client
@@ -166,6 +185,7 @@ src/
   components/ Login, Overview, SessionsTable, ImportWizard, ExportDialog
 tests/
   excel.test.js
+  weekly.test.js
 reference/
   weekend-class-tracker-prototype.html   original prototype and source of the sample data
 ```

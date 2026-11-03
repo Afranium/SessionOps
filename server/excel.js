@@ -68,7 +68,12 @@ export function normalizeDate(value) {
 }
 
 function timeFromDateObject(value) {
-  return `${pad(value.getHours())}:${pad(value.getMinutes())}`;
+  // Excel time cells arrive as 1899-12-30T...Z. Read those in UTC so the clock
+  // time does not shift with the server's timezone.
+  const useUtc = value.getUTCFullYear() < 1900;
+  const hours = useUtc ? value.getUTCHours() : value.getHours();
+  const minutes = useUtc ? value.getUTCMinutes() : value.getMinutes();
+  return `${pad(hours)}:${pad(minutes)}`;
 }
 
 export function normalizeTime(value) {

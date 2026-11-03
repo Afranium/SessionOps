@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type DragEvent } from 'react';
 import {
+  AlertTriangle,
   ArrowLeft,
   CheckCircle2,
   FileSpreadsheet,
@@ -8,8 +9,20 @@ import {
   UploadCloud,
   X
 } from 'lucide-react';
-import { commitImport, previewImport } from '../api';
-import type { Mapping, PreviewResponse } from '../types';
+import { commitImport, commitWeeklyImport, previewImport } from '../api';
+import type { Mapping, PreviewResponse, WeeklySection } from '../types';
+
+const formatSectionDate = (date: string) => {
+  if (!date) return 'No date';
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed.valueOf())) return date;
+  return parsed.toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'UTC'
+  });
+};
 
 const FIELDS: { key: string; label: string; required?: boolean; hint?: string }[] = [
   { key: 'date', label: 'Date', required: true },
@@ -37,7 +50,7 @@ interface Props {
 }
 
 export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props) {
-  const [step, setStep] = useState<'upload' | 'map' | 'done'>('upload');
+  const [step, setStep] = useState<'upload' | 'map' | 'review' | 'done'>('upload');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [dragActive, setDragActive] = useState(false);
@@ -45,7 +58,8 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
   const [sheetIndex, setSheetIndex] = useState(0);
   const [headerRow, setHeaderRow] = useState(0);
   const [mapping, setMapping] = useState<Mapping>({});
-  const [result, setResult] = useState<{ inserted: number; updated: number; skipped: number; total: number } | null>(null);
+  const [result, setResult] = useState<{ inserted: number; updated: number; skipped: number; total: number; sections?: number } | null>(null);
+  const [selectedSections, setSelectedSections] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -58,15 +72,16 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
     setHeaderRow(0);
     setMapping({});
     setResult(null);
+    setSelectedSections(new Set());
     setDragActive(false);
   }, [open]);
 
   if (!open) return null;
 
-  const sheet = preview?.sheets[sheetIndex];
+  const sheet = preview?.sheets?.[sheetIndex];
 
   const applySheet = (index: number) => {
-    if (!preview) return;
+    if (!preview?.sheets) return;
     const next = preview.sheets[index];
     setSheetIndex(index);
     setHeaderRow(next.headerRow);
@@ -79,10 +94,15 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
     try {
       const data = await previewImport(file);
       setPreview(data);
-      setSheetIndex(0);
-      setHeaderRow(data.sheets[0]?.headerRow ?? 0);
-      setMapping({ ...(data.sheets[0]?.suggestedMapping ?? {}) });
-      setStep('map');
+      if (data.mode === 'weekly') {
+        setSelectedSections(new Set((data.sections ?? []).map((section) => section.id)));
+        setStep('review');
+      } else {
+        setSheetIndex(0);
+        setHeaderRow(data.sheets?.[0]?.headerRow ?? 0);
+        setMapping({ ...(data.sheets?.[0]?.suggestedMapping ?? {}) });
+        setStep('map');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not read that file');
     } finally {
@@ -145,6 +165,42 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
     }
   };
 
+  const toggleSection = (id: string) => {
+    setSelectedSections((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const commitWeekly = async () => {
+    if (!preview) return;
+    const sectionIds = [...selectedSections];
+    if (!sectionIds.length) {
+      setError('Select at least one weekend section to import.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const summary = await commitWeeklyImport({ token: preview.token, sectionIds });
+      setResult(summary);
+      setStep('done');
+      await onImported();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const weeklySections: WeeklySection[] = preview?.sections ?? [];
+  const selectedRecords = weeklySections
+    .filter((section) => selectedSections.has(section.id))
+    .reduce((total, section) => total + section.recordCount, 0);
+  const allSelected = weeklySections.length > 0 && selectedSections.size === weeklySections.length;
+
   const rows = sheet?.rows ?? [];
   const headers = rows[headerRow] ?? [];
   const dataRows = rows.slice(headerRow + 1, headerRow + 7);
@@ -169,6 +225,7 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
               <p className="text-[11px] text-slate-500">
                 {step === 'upload' && 'Choose the Excel file the Institute publishes.'}
                 {step === 'map' && 'Match the spreadsheet columns to the tracker fields.'}
+                {step === 'review' && 'Check each weekend, then import the sections you want.'}
                 {step === 'done' && 'The timetable is now in the tracker.'}
               </p>
             </div>
@@ -238,6 +295,125 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
             </div>
           )}
 
+
+          {step === 'review' && (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="min-w-[180px] flex-1">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">File</p>
+                  <p className="mt-1 truncate text-sm text-slate-200">{preview?.filename}</p>
+                </div>
+                <div className="rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-xs text-slate-400">
+                  {weeklySections.length} weekend sections · {weeklySections.reduce((total, section) => total + section.recordCount, 0)} classes
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() =>
+                      setSelectedSections(
+                        allSelected ? new Set() : new Set(weeklySections.map((section) => section.id))
+                      )
+                    }
+                    className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-[11px] text-slate-300 transition hover:bg-white/[0.06]"
+                  >
+                    {allSelected ? 'Clear all' : 'Select all'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setPreview(null);
+                      setStep('upload');
+                    }}
+                    className="text-xs text-slate-400 underline-offset-2 hover:text-white hover:underline"
+                  >
+                    Choose another file
+                  </button>
+                </div>
+              </div>
+
+              <div className="max-h-[46vh] overflow-auto rounded-xl border border-white/[0.07]">
+                <table className="w-full min-w-[760px] text-left text-xs">
+                  <thead className="sticky top-0 z-10 bg-[#0b111d] text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                    <tr>
+                      <th className="w-10 px-3 py-2.5">
+                        <input
+                          type="checkbox"
+                          checked={allSelected}
+                          onChange={() =>
+                            setSelectedSections(
+                              allSelected ? new Set() : new Set(weeklySections.map((section) => section.id))
+                            )
+                          }
+                          className="h-3.5 w-3.5 accent-sky-400"
+                          aria-label="Select all sections"
+                        />
+                      </th>
+                      <th className="px-3 py-2.5 font-medium">Date</th>
+                      <th className="px-3 py-2.5 font-medium">Sheet</th>
+                      <th className="px-3 py-2.5 text-right font-medium">Classes</th>
+                      <th className="px-3 py-2.5 font-medium">Recorded</th>
+                      <th className="px-3 py-2.5 font-medium">Check</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.04]">
+                    {weeklySections.map((section) => {
+                      const selected = selectedSections.has(section.id);
+                      return (
+                        <tr
+                          key={section.id}
+                          onClick={() => toggleSection(section.id)}
+                          className={`cursor-pointer transition ${selected ? 'bg-sky-400/[0.04]' : 'opacity-55 hover:opacity-80'}`}
+                        >
+                          <td className="px-3 py-2.5">
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              onChange={() => toggleSection(section.id)}
+                              onClick={(event) => event.stopPropagation()}
+                              className="h-3.5 w-3.5 accent-sky-400"
+                              aria-label={`Include ${section.sheetName} ${section.date}`}
+                            />
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-2.5">
+                            <span className="font-medium text-slate-200">{formatSectionDate(section.date)}</span>
+                            <span className="ml-1.5 text-slate-500">{section.weekday}</span>
+                          </td>
+                          <td className="max-w-[230px] truncate px-3 py-2.5 text-slate-500" title={section.sheetName}>
+                            {section.sheetName}
+                          </td>
+                          <td className="px-3 py-2.5 text-right tabular-nums text-slate-300">{section.recordCount}</td>
+                          <td className="whitespace-nowrap px-3 py-2.5 text-[11px] text-slate-500">
+                            <span className="text-emerald-300/80">{section.summary.Present} present</span>
+                            {section.summary.Pending > 0 && <span className="ml-1.5">{section.summary.Pending} pending</span>}
+                            {section.summary.Rescheduled > 0 && (
+                              <span className="ml-1.5 text-amber-300/80">{section.summary.Rescheduled} rescheduled</span>
+                            )}
+                            {section.summary.delegated > 0 && (
+                              <span className="ml-1.5 text-sky-300/70">{section.summary.delegated} delegated</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2.5">
+                            {section.warnings.length ? (
+                              <span className="inline-flex items-start gap-1.5 text-[11px] leading-snug text-amber-300">
+                                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                                {section.warnings.join(' · ')}
+                              </span>
+                            ) : (
+                              <span className="text-slate-600">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <p className="text-[11px] leading-relaxed text-slate-600">
+                Classes are matched by course, date, programme, and facilitator. Re-importing updates the
+                timetable but keeps attendance already recorded. Untick any weekend that looks wrong.
+              </p>
+            </div>
+          )}
+
           {step === 'map' && sheet && (
             <div className="space-y-5">
               <div className="flex flex-wrap items-end gap-3">
@@ -245,7 +421,7 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
                   <p className="text-[10px] uppercase tracking-[0.14em] text-slate-500">File</p>
                   <p className="mt-1 truncate text-sm text-slate-200">{preview?.filename}</p>
                 </div>
-                {preview && preview.sheets.length > 1 && (
+                {preview && (preview.sheets?.length ?? 0) > 1 && (
                   <label className="block">
                     <span className="mb-1 block text-[10px] uppercase tracking-[0.14em] text-slate-500">Sheet</span>
                     <select
@@ -253,7 +429,7 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
                       onChange={(event) => applySheet(Number(event.target.value))}
                       className="h-9 rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 text-xs text-slate-200 outline-none focus:border-sky-400/40"
                     >
-                      {preview.sheets.map((item, index) => (
+                      {(preview.sheets ?? []).map((item, index) => (
                         <option key={item.name} value={index}>{item.name}</option>
                       ))}
                     </select>
@@ -386,7 +562,7 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
           )}
         </div>
 
-        {step === 'map' && (
+        {(step === 'map' || step === 'review') && (
           <footer className="flex items-center justify-between gap-3 border-t border-white/[0.07] px-5 py-4">
             <button
               onClick={() => setStep('upload')}
@@ -395,14 +571,18 @@ export function ImportWizard({ open, onClose, onImported, onOpenTracker }: Props
               <ArrowLeft className="h-3.5 w-3.5" /> Back
             </button>
             <div className="flex items-center gap-3">
-              <span className="text-[11px] text-slate-600">Existing attendance is preserved.</span>
+              <span className="text-[11px] text-slate-600">
+                {step === 'review'
+                  ? `${selectedSections.size} of ${weeklySections.length} sections · ${selectedRecords} classes`
+                  : 'Existing attendance is preserved.'}
+              </span>
               <button
-                onClick={commit}
-                disabled={busy}
+                onClick={step === 'review' ? commitWeekly : commit}
+                disabled={busy || (step === 'review' && selectedSections.size === 0)}
                 className="inline-flex items-center gap-2 rounded-lg bg-sky-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-sky-300 disabled:opacity-50"
               >
                 {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-                {busy ? 'Importing…' : 'Import timetable'}
+                {busy ? 'Importing…' : step === 'review' ? `Import ${selectedRecords} classes` : 'Import timetable'}
               </button>
             </div>
           </footer>

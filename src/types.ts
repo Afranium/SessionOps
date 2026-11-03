@@ -32,6 +32,7 @@ export interface SessionRow {
   level: string;
   year: string;
   block: string;
+  extra: Record<string, string>;
   tracking: Tracking;
 }
 
@@ -55,10 +56,35 @@ export interface PreviewSheet {
   suggestedMapping: Record<string, number>;
 }
 
+export interface WeeklySummary {
+  Present: number;
+  Pending: number;
+  Rescheduled: number;
+  Absent: number;
+  delegated: number;
+  withTimes: number;
+}
+
+export interface WeeklySection {
+  id: string;
+  sheetName: string;
+  date: string;
+  weekday: string;
+  rowCount: number;
+  skipped: number;
+  recordCount: number;
+  summary: WeeklySummary;
+  warnings: string[];
+  courses: string[];
+}
+
 export interface PreviewResponse {
   token: string;
   filename: string;
-  sheets: PreviewSheet[];
+  mode: 'flat' | 'weekly';
+  sheets?: PreviewSheet[];
+  sections?: WeeklySection[];
+  academicYear?: { start: number; end: number } | null;
 }
 
 export type Mapping = Record<string, number | null>;

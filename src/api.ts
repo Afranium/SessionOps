@@ -82,12 +82,19 @@ export function commitImport(payload: {
   });
 }
 
-export async function downloadExport(ids: number[] | null) {
+export function commitWeeklyImport(payload: { token: string; sectionIds: string[] }) {
+  return request<{ inserted: number; updated: number; skipped: number; total: number; sections: number }>(
+    '/api/import/weekly/commit',
+    { method: 'POST', body: JSON.stringify(payload) }
+  );
+}
+
+export async function downloadExport(ids: number[] | null, layout: 'weekly' | 'tracking' = 'weekly') {
   const response = await fetch('/api/export', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(ids ? { ids } : {})
+    body: JSON.stringify(ids ? { ids, layout } : { layout })
   });
 
   if (response.status === 401) throw new AuthError('Authentication required');
@@ -106,7 +113,7 @@ export async function downloadExport(ids: number[] | null) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = `session-tracking-${new Date().toISOString().slice(0, 10)}.xlsx`;
+  link.download = `${layout === 'weekly' ? 'IDL-weekend-attendance' : 'session-tracking'}-${new Date().toISOString().slice(0, 10)}.xlsx`;
   link.click();
   URL.revokeObjectURL(url);
 }

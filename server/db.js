@@ -45,6 +45,7 @@ db.exec(`
     level TEXT NOT NULL DEFAULT '',
     year TEXT NOT NULL DEFAULT '',
     block TEXT NOT NULL DEFAULT '',
+    extra TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -76,6 +77,11 @@ if (!trackingColumns.includes('modality_held')) {
   db.exec("ALTER TABLE tracking ADD COLUMN modality_held TEXT NOT NULL DEFAULT ''");
 }
 
+const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all().map((column) => column.name);
+if (!sessionColumns.includes('extra')) {
+  db.exec("ALTER TABLE sessions ADD COLUMN extra TEXT NOT NULL DEFAULT '{}'");
+}
+
 export const nowIso = () => new Date().toISOString();
 
 export function listSessions() {
@@ -84,7 +90,7 @@ export function listSessions() {
       `SELECT
         s.id, s.external_key, s.date, s.day, s.start_time, s.end_time, s.centre, s.modality,
         s.programme, s.course_code, s.course_title, s.facilitator, s.facilitator_phone,
-        s.facilitator_email, s.level, s.year, s.block,
+        s.facilitator_email, s.level, s.year, s.block, s.extra,
         t.status, t.actual_start, t.actual_end, t.participants, t.delegated, t.substitute,
         t.modality_held, t.reschedule_date, t.reschedule_time, t.notes, t.updated_at
       FROM sessions s
