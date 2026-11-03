@@ -6,6 +6,9 @@ dist/
 .vite/
 server/uploads/
 data/
+*.db
+*.db-wal
+*.db-shm
 *.log
 .DS_Store
 .vscode/

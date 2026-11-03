@@ -9,5 +9,9 @@ export default defineConfig({
     proxy: {
       '/api': 'http://localhost:3002'
     }
+  },
+  build: {
+    target: 'es2020',
+    sourcemap: false
   }
 });
